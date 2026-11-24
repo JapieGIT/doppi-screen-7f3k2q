@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Doppi Screen</title>
+<style>
+  :root {
+    --bg: #000;
+    --neon: #ffd21f;
+    --neon-dim: #8a6f0a;
+    --text: #f5f0dc;
+    --muted: #8c8672;
+    --ok: #3ddc84;
+    --warn: #ffb020;
+    --err: #ff4d4d;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+    font: 16px/1.4 -apple-system, system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+    touch-action: none; overscroll-behavior: none;
+  }
+
+  /* ---- full-screen layers ---- */
+  .layer { position: fixed; inset: 0; display: none; }
+  .layer.show { display: block; }
+  video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; background: var(--bg);
+  }
+  #vendVideo { opacity: 0; transition: opacity .25s ease; }
+  #vendVideo.show { opacity: 1; }
+
+  /* ---- setup screens (loading / connect) ---- */
+  .center {
+    position: fixed; inset: 0; display: none; flex-direction: column;
+    align-items: center; justify-content: center; gap: 20px; padding: 24px; text-align: center;
+  }
+  .center.show { display: flex; }
+  .logo {
+    font-size: clamp(56px, 12vw, 120px); font-weight: 800; letter-spacing: -.02em;
+    color: var(--neon); text-shadow: 0 0 12px rgba(255,210,31,.55), 0 0 36px rgba(255,210,31,.25);
+  }
+  .msg { color: var(--muted); font-size: 18px; max-width: 520px; }
+  .msg.err { color: var(--err); }
+  .bar { width: min(420px, 80vw); height: 6px; border-radius: 3px; background: #222; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--neon); transition: width .2s; }
+  button.big {
+    font: inherit; font-size: 24px; font-weight: 700; color: #000; background: var(--neon);
+    border: 0; border-radius: 16px; padding: 20px 44px; cursor: pointer;
+    box-shadow: 0 0 24px rgba(255,210,31,.35);
+  }
+  button.big:active { transform: scale(.98); }
+
+  /* ---- connection dot (staff only) ---- */
+  #dot {
+    position: fixed; right: 14px; bottom: 14px; width: 10px; height: 10px; border-radius: 50%;
+    background: var(--ok); opacity: 0; transition: opacity .3s, background .3s; pointer-events: none; z-index: 5;
+  }
+  #dot.warn { background: var(--warn); opacity: .8; }
+  #dot.err  { background: var(--err);  opacity: .8; }
+  body.debug #dot { opacity: .8; }
+
+  /* ---- debug panel (?debug) ---- */
+  #debug {
+    position: fixed; left: 12px; top: 12px; width: min(440px, calc(100vw - 24px)); z-index: 10;
+    background: rgba(20,20,18,.9); border: 1px solid #333; border-radius: 12px; padding: 12px;
+    font: 12px/1.45 ui-monospace, Menlo, monospace; color: var(--text); display: none;
+    touch-action: auto; -webkit-user-select: text; user-select: text;
+  }
+  body.debug #debug { display: block; }
+  #debug .row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  #debug button {
+    font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid #444;
+    background: #2a2a27; color: var(--text); cursor: pointer;
+  }
+  #debug .kv { color: var(--muted); margin-bottom: 6px; }
+  #debug .kv b { color: var(--text); font-weight: 600; }
+  #log { max-height: 40vh; overflow: auto; white-space: pre-wrap; color: var(--muted); margin: 0; }
+</style>
+</head>
+<body>
+
+<!-- Stage: idle loop underneath, vend video on top -->
+<div id="stage" class="layer">
+  <video id="idleVideo" muted playsinline loop preload="auto"></video>
+  <video id="vendVideo" muted playsinline preload="auto"></video>
+</div>
+
+<!-- Loading videos into memory -->
+<div id="loading" class="center show">
+  <div class="logo">doppi</div>
+  <div class="bar"><div id="barFill"></div></div>
+  <div class="msg" id="loadMsg">Loading videos…</div>
+</div>
+
+<!-- Connect (needs one tap: Bluefy's device picker and video playback both require it) -->
+<div id="connect" class="center">
+  <div class="logo">doppi</div>
+  <button class="big" id="connectBtn">Tap to connect</button>
+  <div class="msg" id="connectMsg">Videos loaded. You can switch off the hotspot now.</div>
+</div>
+
+<div id="dot"></div>
+
+<div id="debug">
+  <div class="kv">ble <b id="dbgBle">–</b> · dispensing <b id="dbgVal">–</b> · playing <b id="dbgPlay">–</b></div>
+  <div class="row">
+    <button id="simStart">Simulate start (1)</button>
+    <button id="simEnd">Simulate end (0)</button>
+    <button id="hideDebug">Hide</button>
+  </div>
+  <pre id="log"></pre>
+</div>
+
+<script>
+// ============================== configuration ==============================
+// The Boron firmware must expose this service and characteristic.
+// dispensing: 1 byte, read + notify, 1 while a vend runs, 0 otherwise.
+const CONFIG = {
+  deviceNamePrefix: 'Doppi',
+  serviceUuid:      '953fc0ec-7995-411a-8363-1a0013554bfe',
+  dispensingUuid:   'd1c1060a-28e8-4371-90e5-b1b09b5b6460',
+
+  // Played at random (never the same one twice in a row) when dispensing starts.
+  vendVideos: [
+    'videos/doppi-01-classic.mp4',
+    'videos/doppi-02-bubble-trouble.mp4',
+    'videos/doppi-03-ice-cold.mp4',
+    'videos/doppi-04-bartender-pro.mp4',
+    'videos/doppi-05-hype-dance.mp4',
+  ],
+  // Loops whenever nothing is dispensing.
+  idleVideo: 'videos/idle.mp4',
+
+  // When dispensing ends (1 -> 0): 'finish' lets the vend video play to its end,
+  // 'cut' returns to idle immediately.
+  onDispenseEnd: 'finish',
+  // Safety net: never stay on a vend video longer than this.
+  maxVendMs: 40000,
+  // Reconnect back-off after the Bluetooth link drops.
+  reconnectMinMs: 1000,
+  reconnectMaxMs: 10000,
+};
+
+// ?debug shows the log panel and simulate buttons.
+// ?sim   skips Bluetooth entirely (desk testing in any browser); implies ?debug.
+const params = new URLSearchParams(location.search);
+const SIM   = params.has('sim');
+const POC   = params.has('poc');
+const DEBUG = SIM || POC || params.has('debug');
+
+// ?poc talks to the boron-ble-poc firmware instead: its `state` byte is 0/1 and
+// a single MODE click toggles it, so A -> B (0 -> 1) stands in for a vend start.
+if (POC) {
+  CONFIG.deviceNamePrefix = 'BoronState';
+  CONFIG.serviceUuid      = '54bbbb2d-4780-4224-bba9-90f3940889a7';
+  CONFIG.dispensingUuid   = '136cd8c8-0891-432e-b6c1-aaa885c13b35';
+}
+
+// ============================== helpers ==============================
+const $ = (id) => document.getElementById(id);
+const idleVideo = $('idleVideo');
+const vendVideo = $('vendVideo');
+
+function log(line) {
+  const t = new Date().toLocaleTimeString();
+  console.log(`[screen] ${line}`);
+  const el = $('log');
+  el.textContent = `${t}  ${line}\n` + el.textContent.slice(0, 8000);
+}
+
+function showOnly(id) {
+  for (const s of ['loading', 'connect']) $(s).classList.toggle('show', s === id);
+  $('stage').classList.toggle('show', id === 'stage');
+}
+
+function setBle(state) {          // 'ok' | 'warn' | 'err'
+  $('dot').className = state === 'ok' ? '' : state;
+  $('dbgBle').textContent = state;
+}
+
+if (DEBUG) document.body.classList.add('debug');
+
+// ============================== video preload ==============================
+// Every video is downloaded into memory (blob URLs) while the hotspot is on.
+// After that the page never touches the network, so it keeps working offline
+// for as long as it stays open.
+const blobs = { vend: [], idle: null };
+
+async function fetchToBlob(url, onBytes) {
+  const res = await fetch(url, { cache: 'reload' });
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  if (!res.body || !res.body.getReader) {
+    const b = await res.blob();
+    onBytes(b.size);
+    return URL.createObjectURL(b);
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    onBytes(value.byteLength);
+  }
+  return URL.createObjectURL(new Blob(chunks, { type: 'video/mp4' }));
+}
+
+async function preload() {
+  const all = [...CONFIG.vendVideos, CONFIG.idleVideo];
+  // Sizes for the progress bar (falls back to counting files if HEAD is not allowed).
+  let total = 0;
+  try {
+    const sizes = await Promise.all(all.map(u => fetch(u, { method: 'HEAD', cache: 'reload' })
+      .then(r => Number(r.headers.get('content-length')) || 0)));
+    total = sizes.reduce((a, b) => a + b, 0);
+  } catch (_) { total = 0; }
+
+  let loaded = 0, files = 0;
+  const progress = () => {
+    const pct = total ? loaded / total : files / all.length;
+    $('barFill').style.width = `${Math.min(100, pct * 100).toFixed(1)}%`;
+    $('loadMsg').textContent = `Loading videos… ${files}/${all.length}` +
+      (total ? ` (${(loaded / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB)` : '');
+  };
+  const onBytes = (n) => { loaded += n; progress(); };
+
+  for (const url of CONFIG.vendVideos) {
+    blobs.vend.push(await fetchToBlob(url, onBytes));
+    files++; progress();
+  }
+  blobs.idle = await fetchToBlob(CONFIG.idleVideo, onBytes);
+  files++; progress();
+  log(`preloaded ${files} videos (${(loaded / 1e6).toFixed(1)} MB)`);
+}
+
+// ============================== playback ==============================
+let playing = false;
+let lastIndex = -1;
+let safetyTimer = null;
+
+function pickVideo() {
+  const n = blobs.vend.length;
+  if (n === 1) return 0;
+  let i;
+  do { i = Math.floor(Math.random() * n); } while (i === lastIndex);
+  return i;
+}
+
+function playIdle() {
+  vendVideo.classList.remove('show');
+  idleVideo.play().catch(err => log(`idle play failed: ${err.message}`));
+}
+
+function startVend() {
+  if (playing) { log('start ignored: already playing'); return; }
+  playing = true;
+  $('dbgPlay').textContent = 'yes';
+  const i = pickVideo();
+  lastIndex = i;
+  log(`dispensing started -> ${CONFIG.vendVideos[i].split('/').pop()}`);
+
+  vendVideo.src = blobs.vend[i];
+  vendVideo.currentTime = 0;
+  // Fade in only once frames are actually coming, so there is no black flash.
+  vendVideo.addEventListener('playing', () => {
+    vendVideo.classList.add('show');
+    idleVideo.pause();
+  }, { once: true });
+  vendVideo.play().catch(err => { log(`vend play failed: ${err.message}`); backToIdle('play-error'); });
+
+  clearTimeout(safetyTimer);
+  safetyTimer = setTimeout(() => backToIdle('safety timeout'), CONFIG.maxVendMs);
+}
+
+function backToIdle(why) {
+  if (!playing) return;
+  playing = false;
+  $('dbgPlay').textContent = 'no';
+  clearTimeout(safetyTimer);
+  log(`back to idle (${why})`);
+  idleVideo.currentTime = 0;
+  playIdle();
+  // Let the fade-out finish before stopping the vend video.
+  setTimeout(() => { if (!playing) vendVideo.pause(); }, 300);
+}
+
+vendVideo.addEventListener('ended', () => backToIdle('video ended'));
+vendVideo.addEventListener('error', () => backToIdle('video error'));
+
+// ============================== dispensing signal ==============================
+let lastValue = null;   // null until the first read after a (re)connect
+
+function onDispensing(value, source) {
+  $('dbgVal').textContent = String(value);
+  const prev = lastValue;
+  lastValue = value;
+  if (source === 'read') {
+    // Baseline after a (re)connect: never start a video halfway through a vend.
+    log(`dispensing=${value} (read on connect)`);
+    return;
+  }
+  log(`dispensing=${value} (${source})`);
+  if (value === 1 && prev !== 1) startVend();
+  if (value === 0 && prev === 1 && CONFIG.onDispenseEnd === 'cut') backToIdle('dispensing ended');
+}
+
+// ============================== Bluetooth ==============================
+let device = null;
+let characteristic = null;
+let reconnectDelay = CONFIG.reconnectMinMs;
+let reconnectTimer = null;
+
+function onCharChanged(e) { onDispensing(e.target.value.getUint8(0), 'notify'); }
+
+async function connectGatt() {
+  setBle('warn');
+  const server = await device.gatt.connect();
+  const service = await server.getPrimaryService(CONFIG.serviceUuid);
+  if (characteristic) characteristic.removeEventListener('characteristicvaluechanged', onCharChanged);
+  characteristic = await service.getCharacteristic(CONFIG.dispensingUuid);
+  characteristic.addEventListener('characteristicvaluechanged', onCharChanged);
+  await characteristic.startNotifications();
+  lastValue = null;
+  onDispensing((await characteristic.readValue()).getUint8(0), 'read');
+  reconnectDelay = CONFIG.reconnectMinMs;
+  setBle('ok');
+  log(`connected to ${device.name || 'device'}`);
+}
+
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  const delay = reconnectDelay;
+  reconnectDelay = Math.min(reconnectDelay * 2, CONFIG.reconnectMaxMs);
+  log(`reconnecting in ${delay} ms`);
+  reconnectTimer = setTimeout(async () => {
+    if (device.gatt.connected) return;
+    try { await connectGatt(); }
+    catch (err) { log(`reconnect failed: ${err.message}`); setBle('err'); scheduleReconnect(); }
+  }, delay);
+}
+
+function onDisconnected() {
+  // The screen keeps showing idle (or finishes the current video); customers never see this.
+  log('bluetooth disconnected');
+  setBle('err');
+  scheduleReconnect();
+}
+
+// ============================== start-up ==============================
+// Runs inside the tap. Both videos are muted (the files have no sound), and
+// WebKit lets muted inline video play without a gesture, so only the idle loop
+// is started here. Do NOT call play() on the empty vend video: the promise
+// stays pending until a src arrives and would then pause the first vend video.
+function unlockVideo() {
+  idleVideo.play().catch(() => {});
+}
+
+async function keepAwake() {
+  try {
+    if ('wakeLock' in navigator) {
+      await navigator.wakeLock.request('screen');
+      log('wake lock held');
+    }
+  } catch (err) { log(`wake lock unavailable: ${err.message}`); }
+}
+
+async function onConnectTap() {
+  unlockVideo();
+  if (SIM) {
+    log('sim mode: Bluetooth skipped');
+    setBle('ok');
+    showOnly('stage');
+    playIdle();
+    keepAwake();
+    return;
+  }
+  if (!navigator.bluetooth) {
+    $('connectMsg').textContent = 'This browser has no Web Bluetooth. Open the page in Bluefy.';
+    $('connectMsg').className = 'msg err';
+    return;
+  }
+  let picked;
+  try {
+    picked = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [CONFIG.serviceUuid] }, { namePrefix: CONFIG.deviceNamePrefix }],
+      optionalServices: [CONFIG.serviceUuid],
+    });
+  } catch (err) {
+    $('connectMsg').textContent = `No device chosen (${err.message}). Tap to try again.`;
+    $('connectMsg').className = 'msg err';
+    return;
+  }
+  device = picked;
+  device.addEventListener('gattserverdisconnected', onDisconnected);
+  $('connectMsg').textContent = `Connecting to ${device.name || 'device'}…`;
+  $('connectMsg').className = 'msg';
+  try {
+    await connectGatt();
+  } catch (err) {
+    log(`connect failed: ${err.message}`);
+    $('connectMsg').textContent = `Could not connect (${err.message}). Tap to try again.`;
+    $('connectMsg').className = 'msg err';
+    device.removeEventListener('gattserverdisconnected', onDisconnected);
+    device = null;
+    return;
+  }
+  showOnly('stage');
+  playIdle();
+  keepAwake();
+}
+
+$('connectBtn').addEventListener('click', onConnectTap);
+$('simStart').addEventListener('click', () => onDispensing(1, 'simulated'));
+$('simEnd').addEventListener('click', () => onDispensing(0, 'simulated'));
+$('hideDebug').addEventListener('click', () => document.body.classList.remove('debug'));
+
+// Coming back to the foreground: iOS pauses media, and the wake lock is released.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !$('stage').classList.contains('show')) return;
+  if (playing) vendVideo.play().catch(() => {}); else idleVideo.play().catch(() => {});
+  keepAwake();
+});
+
+window.addEventListener('beforeunload', () => {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+});
+
+(async () => {
+  if (SIM) $('connectBtn').textContent = 'Tap to start (simulation)';
+  try {
+    await preload();
+  } catch (err) {
+    log(`preload failed: ${err.message}`);
+    $('loadMsg').textContent = `Could not load the videos (${err.message}). Check the hotspot and reload the page.`;
+    $('loadMsg').className = 'msg err';
+    return;
+  }
+  idleVideo.src = blobs.idle;
+  showOnly('connect');
+})();
+</script>
+</body>
+</html>
