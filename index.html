@@ -340,8 +340,19 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(async () => {
     if (device.gatt.connected) return;
     try { await connectGatt(); }
-    catch (err) { log(`reconnect failed: ${err.message}`); setBle('err'); scheduleReconnect(); }
+    catch (err) {
+      log(`reconnect failed: ${err.message}`);
+      setBle('err');
+      dropHalfOpenLink();
+      scheduleReconnect();
+    }
   }, delay);
+}
+
+// connect() can succeed and a later step (service, notifications) fail. Left
+// open, that link makes the retry timer think all is well and stop retrying.
+function dropHalfOpenLink() {
+  try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch (_) {}
 }
 
 function onDisconnected() {
@@ -406,6 +417,7 @@ async function onConnectTap() {
     $('connectMsg').textContent = `Could not connect (${err.message}). Tap to try again.`;
     $('connectMsg').className = 'msg err';
     device.removeEventListener('gattserverdisconnected', onDisconnected);
+    dropHalfOpenLink();
     device = null;
     return;
   }
